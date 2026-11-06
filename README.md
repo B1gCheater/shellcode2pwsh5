@@ -1,6 +1,6 @@
 # shellcode2pwsh5
 
-Convert a raw shellcode binary into a self-contained Windows PowerShell script.
+Package raw shellcode or a native Windows PE into a self-contained Windows PowerShell script.
 
 `shellcode2pwsh5` is a small Go command-line utility for authorized security research, malware analysis, and controlled red-team testing. It packages a shellcode payload into a generated `.ps1`, `.bat`, or `.cmd` file so the payload can be decoded and invoked by Windows PowerShell 5.1 without a separate payload file at runtime.
 
@@ -12,16 +12,16 @@ Convert a raw shellcode binary into a self-contained Windows PowerShell script.
 - Two execution modes: run the payload inside the PowerShell process itself, or inject it into matching processes with `--process`.
 - Target x86 or x64 Windows PowerShell processes.
 - Optionally embed a SHA-256 integrity check that runs before execution.
-- Optionally control console visibility for authorized, unattended test environments.
+- Optionally start the runner in a separate Windows PowerShell process without a console window.
 - Produce a standalone Go utility with no third-party Go dependencies.
 
 ## Execution modes
 
-### Local (default)
+### Shellcode local (default)
 
 Without `--process` the generated script allocates memory in its own process, copies the payload in, changes the protection from read/write to read/execute and starts it on a thread. The script exits with the payload's exit code.
 
-### Remote (`--process`)
+### Shellcode remote (`--process`)
 
 With `--process <pattern>` the generated script finds every running process whose image name matches the pattern, writes the payload into each of their address spaces and starts it there with `CreateRemoteThread`:
 
@@ -48,7 +48,7 @@ Only one `--process` pattern may be given; passing it twice is an error.
 - The payload bitness must match the bitness of the target process. A 32-bit payload cannot run in a 64-bit process and the other way round. The script checks this per target and reports a mismatch instead of crashing the target.
 - A 32-bit PowerShell cannot inject into a 64-bit process at all, so the generated script must run under a 64-bit PowerShell for 64-bit targets.
 - Targets that need elevated rights are reached through `SeDebugPrivilege`, which the script enables when possible. Protected Process Light (PPL) targets such as some antivirus processes reject injection regardless.
-- The payload must be position-independent. Convert a PE file with a tool such as `donut` before feeding it to this utility.
+- Shellcode payloads must be position-independent.
 
 #### Examples
 
@@ -66,11 +66,42 @@ REM inject and give up waiting after 10 seconds
 shellcode2pwsh5 -i payload.bin -f bat -p notep --timeout 10000
 ```
 
+### Payload type detection
+
+When `--type` is omitted, the packer checks the input contents for a PE signature and uses the PE header to distinguish DLL from EXE. Inputs without a PE signature are treated as shellcode, regardless of the file extension. A recognized PE with invalid headers or an unsupported architecture returns an error. Use `--type shellcode` to explicitly package the input as raw bytes.
+
+### Native PE (`--type dll` or `--type exe`)
+
+Each script Base64-decodes the PE in memory and passes the bytes to the embedded PowerSploit loader. Supply one input file. The packer reads the PE header to determine x86 or x64 and checks an explicit `--arch` against it. Managed assemblies are rejected.
+
+- `--type dll` calls the case-sensitive `void VoidFunc(void)` export. With `-p`, it tries each matching process and returns after starting the exports. The DLL stays mapped in the target process.
+- `--type exe` runs the EXE entry point in the PowerShell process and rejects `-p`. Run the wrapper in its own PowerShell process. Compatibility depends on the EXE's startup and runtime requirements.
+- PE mode uses exit status 0 for successful loading or launch, 2 for damaged data, 3 for a PowerShell architecture mismatch, 4 for a loading failure and 5 for no matching process. Shellcode alone supports `--timeout`, `--detach` and payload exit-code forwarding.
+
+```bat
+shellcode2pwsh5 --type dll -i example.dll -f cmd -p notepad --verify
+shellcode2pwsh5 --type exe -i example.exe -f bat --verify
+```
+
+To embed EXE arguments, repeat `--exe-arg=<arg>` once per argument. Values are
+passed in the order given, including repeated values and empty values
+(`--exe-arg=`). Use the calling shell's quoting rules to keep each value intact.
+The packer quotes the received values for the EXE's Windows command line.
+
+```powershell
+.\shellcode2pwsh5.exe -i .\example.exe -f ps1 `
+  --exe-arg=--path '--exe-arg=C:\Program Files\Example' --exe-arg=--mkdir
+```
+
+The embedded PE loader is distributed under the [PowerSploit BSD 3-Clause license](PowerSploit-LICENSE).
+
 ## Runtime requirements
 
-Generated scripts target **Windows PowerShell 5.1** (`powershell.exe`) and require the .NET Framework facilities used by PowerShell's `Add-Type` implementation. They are not intended for PowerShell 7, PowerShell Core, Linux, or macOS.
+Generated payload cores target **Windows PowerShell 5.1** (`powershell.exe`) and use .NET Framework facilities. Run foreground PE scripts with `powershell.exe`. On Windows, a `--hidden` PowerShell script can also be started from PowerShell 7 because its launcher runs the payload core in Windows PowerShell 5.1.
 
-The current release supports raw shellcode payloads only. The `-type` option currently accepts `shellcode`; other payload types are not implemented.
+### Background launch (`--hidden`)
+
+For `.ps1`, `.bat` and `.cmd`, the launcher starts a separate PowerShell process without a console window and returns when the child starts. Exit status 0 means the launch succeeded. The child reads the core from the generated script and handles verification and execution independently. Payload output and exit codes are unavailable to the calling terminal in this mode.
 
 ## Build
 
@@ -104,7 +135,7 @@ When enabled, the generated script checks the decoded payload's expected size an
 ## Security considerations
 
 - Generated scripts execute machine code. Inspect the input and generated output, and test only in an isolated, authorized environment.
-- Console visibility is a presentation setting, not a security boundary. Use it only where concealment is explicitly approved by the environment owner.
+- Use background launch only where unattended execution is approved by the environment owner.
 - SHA-256 checking detects changes relative to the embedded value; it does not authenticate the publisher.
 - The generated script contains the payload as Base64 text. Treat it as executable code and protect it accordingly.
 - Remote injection uses a well-known API sequence (`OpenProcess`, `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`) that endpoint security products monitor closely. Generated scripts are more likely to be flagged or blocked than the local variant.
