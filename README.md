@@ -93,7 +93,7 @@ The packer quotes the received values for the EXE's Windows command line.
   --exe-arg=--path '--exe-arg=C:\Program Files\Example' --exe-arg=--mkdir
 ```
 
-The embedded PE loader is distributed under the [PowerSploit BSD 3-Clause license](PowerSploit-LICENSE).
+The embedded PE loader is distributed under the [PowerSploit BSD 3-Clause license](PowerSploit-LICENSE). It is stored in `psloader.go`, gzip-compressed and Base64-encoded, so the build needs no separate script asset. `tools/psloader` regenerates that file from a loader script and restores the plaintext copy on demand.
 
 ## Runtime requirements
 
@@ -128,6 +128,22 @@ You can also build directly with Go:
 go build -trimpath -buildvcs=false -ldflags "-s -w" -o shellcode2pwsh5.exe .
 ```
 
+All PowerShell content, including the reflective PE loader, lives in `.go` files, so the build needs nothing besides the Go sources.
+
+### Reflective loader asset
+
+`psloader.go` is generated and carries the PowerSploit loader as a compressed blob together with its license notice and a size/SHA-256 check that runs at start-up.
+
+```bat
+rem rebuild the generated file from a loader script
+go run ./tools/psloader -in loader.ps1 -license PowerSploit-LICENSE -out psloader.go
+
+rem write the plaintext loader back out for review or patching
+go run ./tools/psloader -extract loader.ps1
+```
+
+Use `-raw` to store the loader as a readable Go raw string instead of a compressed blob; the generated scripts are identical either way.
+
 ## Integrity checks
 
 When enabled, the generated script checks the decoded payload's expected size and SHA-256 digest before execution. This can detect accidental truncation or modification. Because the expected digest is stored in the generated script itself, it does not prove who created the script or provide a digital signature.
@@ -152,6 +168,12 @@ The payload's own exit code is passed through when the payload thread was allowe
 | 5 | no process matched the target pattern |
 | 6 | target process could not be opened |
 | 7 | timed out waiting for the payload thread |
+
+When several processes match `-p`, each one is handled independently. A target that cannot be opened, written to, or matched by architecture produces a warning on stderr and does not change the exit code as long as at least one target was injected; codes 3, 4 and 6 describe a run in which nothing could be injected.
+
+```
+B2P: warning: 1 of 2 matching processes could not be injected (see above), continuing with 1
+```
 
 ## Project status
 

